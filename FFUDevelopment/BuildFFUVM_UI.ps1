@@ -424,4 +424,41 @@ $window.Add_Closed({
         # [System.GC]::WaitForPendingFinalizers()
     })
 
+function Get-UIConfig {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject]$State
+    )
+
+    # Get the base configuration from the core module
+    $config = FFUUI.Core\Get-UIConfig -State $State
+
+    # Safely find PXE controls in the XAML. If they do not exist,
+    # we just return the base config unchanged.
+    $window = $State.Window
+    if (-not $window) {
+        return $config
+    }
+
+    $chkPXE          = $window.FindName('chkCreatePXEBootMedia')
+    $chkUseShare     = $window.FindName('chkUseNetworkShareForDeploy')
+    $txtPXESharePath = $window.FindName('txtPXENetworkSharePath')
+
+    if ($chkPXE) {
+        $config | Add-Member -NotePropertyName 'CreatePXEBootMedia' -NotePropertyValue ([bool]$chkPXE.IsChecked) -Force
+    }
+
+    if ($chkUseShare) {
+        $config | Add-Member -NotePropertyName 'UseNetworkShareForDeploy' -NotePropertyValue ([bool]$chkUseShare.IsChecked) -Force
+    }
+
+    if ($txtPXESharePath) {
+        $config | Add-Member -NotePropertyName 'PXENetworkSharePath' -NotePropertyValue ($txtPXESharePath.Text.Trim()) -Force
+    }
+
+    return $config
+}
+
+
 [void]$window.ShowDialog()

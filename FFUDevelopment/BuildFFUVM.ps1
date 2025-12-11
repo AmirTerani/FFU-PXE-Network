@@ -311,6 +311,9 @@ param(
     [string]$VMHostIPAddress,
     [bool]$CreateCaptureMedia = $true,
     [bool]$CreateDeploymentMedia,
+    [bool]$CreatePXEBootMedia,
+    [bool]$UseNetworkShareForDeploy,
+    [string]$PXENetworkSharePath,
     [ValidateScript({
             $allowedFeatures = @("Windows-Defender-Default-Definitions", "Printing-PrintToPDFServices-Features", "Printing-XPSServices-Features", "TelnetClient", "TFTP",
                 "TIFFIFilter", "LegacyComponents", "DirectPlay", "MSRDC-Infrastructure", "Windows-Identity-Foundation", "MicrosoftWindowsPowerShellV2Root", "MicrosoftWindowsPowerShellV2",
@@ -710,6 +713,46 @@ function Test-Url {
         return $false
     }
 }
+
+
+function Get-PxeShareMapping {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SharePath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($SharePath)) {
+        throw "PXENetworkSharePath is empty. Configure it in the UI or config file."
+    }
+
+    # Normalize UNC: ensure it starts with double backslash
+    if (-not $SharePath.StartsWith('\\')) {
+        throw "PXENetworkSharePath must be a UNC path such as \\server\share. Current value is: $SharePath"
+    }
+
+    WriteLog "Prompting for network credentials for $SharePath"
+    $cred = Get-Credential -Message "Enter credentials that have read and write access to $SharePath"
+
+    # Choose a transient drive letter that is unlikely to be in use
+    $driveLetter = 'Z'
+
+    # Remove any existing PSDrive with this name
+    $existing = Get-PSDrive -Name $driveLetter -ErrorAction SilentlyContinue
+    if ($existing) {
+        Remove-PSDrive -Name $driveLetter -Force
+    }
+
+    WriteLog "Mapping $SharePath to drive $driveLetter`: with provided credentials"
+    New-PSDrive -Name $driveLetter -PSProvider FileSystem -Root $SharePath -Credential $cred -Scope Global | Out-Null
+
+    return [pscustomobject]@{
+        DriveLetter = $driveLetter
+        SharePath   = $SharePath
+        Credential  = $cred
+    }
+}
+
 
 function Get-MicrosoftDrivers {
     param (
@@ -2669,6 +2712,26 @@ function New-PEMedia {
         WriteLog "Copying $FFUDevelopmentPath\WinPEDeployFFUFiles\* to WinPE deploy media"
         Copy-Item -Path "$FFUDevelopmentPath\WinPEDeployFFUFiles\*" -Destination "$WinPEFFUPath\mount" -Recurse -Force | Out-Null
         WriteLog 'Copy complete'
+
+        
+    # If we have PXE context, stamp the deployment script with the correct paths
+    if ($UseNetworkShareForDeploy -and $script:PXEDeployContext) {
+        $deployScriptPath = Join-Path "$WinPEFFUPath\mount" "DeployFFUFromShare.ps1"
+
+        if (Test-Path $deployScriptPath) {
+            WriteLog "Stamping DeployFFUFromShare.ps1 with PXE paths"
+
+            $content = Get-Content $deployScriptPath -Raw
+            $content = $content.Replace("##PXE_SHARE_PATH##", $script:PXEDeployContext.SharePath)
+            $content = $content.Replace("##PXE_REL_FFU##",    $script:PXEDeployContext.RelativeFFU)
+
+            Set-Content -Path $deployScriptPath -Value $content -Encoding UTF8
+        }
+        else {
+            WriteLog "DeployFFUFromShare.ps1 not found in WinPEDeployFFUFiles, PXE stamping skipped."
+        }
+    }
+
         #If $CopyPEDrivers = $true, add drivers to WinPE media using dism
         if ($CopyPEDrivers) {
             WriteLog "Adding drivers to WinPE media"
@@ -2688,6 +2751,31 @@ function New-PEMedia {
     WriteLog 'Dismounting WinPE media' 
     Dismount-WindowsImage -Path "$WinPEFFUPath\mount" -Save | Out-Null
     WriteLog 'Dismount complete'
+
+        # Optional: export boot.wim for PXE network deployment
+    if ($CreatePXEBootMedia -and $UseNetworkShareForDeploy -and $script:PXEDeployContext) {
+
+        WriteLog "CreatePXEBootMedia is enabled. Preparing PXE boot.wim for network share."
+
+        $bootWimPath = "$WinPEFFUPath\media\sources\boot.wim"
+
+        # Ensure the share is still mapped
+        $deployRoot = "$($script:PXEDeployContext.LocalDrive):"
+        $bootFolder = Join-Path $deployRoot "Boot"
+        if (-not (Test-Path $bootFolder)) {
+            WriteLog "Creating PXE boot folder at $bootFolder"
+            New-Item -Path $bootFolder -ItemType Directory -Force | Out-Null
+        }
+
+        $bootTarget = Join-Path $bootFolder "boot.wim"
+        WriteLog "Copying WinPE boot.wim to $bootTarget"
+        Copy-Item -Path $bootWimPath -Destination $bootTarget -Force
+
+        WriteLog "PXE boot.wim copy complete"
+    }
+
+
+
     #Make ISO
     if ($WindowsArch -eq 'x64') {
         $OSCDIMGPath = "$adkPath`Assessment and Deployment Kit\Deployment Tools\amd64\Oscdimg"
@@ -2920,6 +3008,37 @@ function New-FFU {
         WriteLog 'FFU Capture complete'
         Dismount-ScratchVhdx -VhdxPath $VHDXPath
     }
+
+    # After $FFUFile has been resolved and the capture is complete
+
+    if ($UseNetworkShareForDeploy -and -not [string]::IsNullOrWhiteSpace($PXENetworkSharePath)) {
+
+        WriteLog "UseNetworkShareForDeploy is enabled. Preparing to copy FFU to $PXENetworkSharePath"
+
+        $pxeMapping = Get-PxeShareMapping -SharePath $PXENetworkSharePath
+        $deployRoot = "$($pxeMapping.DriveLetter):"
+
+        # Create a folder structure for the FFU
+        $ffuFolder = Join-Path $deployRoot "FFU"
+        if (-not (Test-Path $ffuFolder)) {
+            WriteLog "Creating FFU folder at $ffuFolder"
+            New-Item -Path $ffuFolder -ItemType Directory -Force | Out-Null
+        }
+
+        $ffuTarget = Join-Path $ffuFolder (Split-Path $FFUFile -Leaf)
+        WriteLog "Copying FFU $FFUFile to $ffuTarget"
+        Copy-Item -Path $FFUFile -Destination $ffuTarget -Force
+
+        # Store the network path we will later embed into WinPE scripts
+        $script:PXEDeployContext = [pscustomobject]@{
+            SharePath     = $PXENetworkSharePath
+            RelativeFFU   = "FFU\$(Split-Path $FFUFile -Leaf)"
+            LocalDrive    = $pxeMapping.DriveLetter
+        }
+
+        WriteLog "FFU copy to network share complete"
+    }
+
 
     #Without this 120 second sleep, we sometimes see an error when mounting the FFU due to a file handle lock. Needed for both driver and optimize steps.
     

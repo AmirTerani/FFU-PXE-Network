@@ -754,8 +754,26 @@
                             <CheckBox x:Name="chkVerbose" Content="Verbose" Margin="5" VerticalAlignment="Center" Tag="When set to $true, will enable write-verbose output to the console for the build script."/>
                         </WrapPanel>
 
+                        
+                        <StackPanel Grid.Row="9" Margin="5,0,0,5">
+                            <CheckBox x:Name="chkCreatePXEBootMedia"
+                                    Content="Create PXE boot.wim for network deployment"
+                                    Margin="0,0,0,2"/>
+                            <CheckBox x:Name="chkUseNetworkShareForDeploy"
+                                    Content="Use network share for deployment content"
+                                    Margin="0,0,0,2"/>
+                            <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                                <TextBlock Text="PXE or network share path:"
+                                        VerticalAlignment="Center"
+                                        Margin="0,0,6,0" />
+                                <TextBox x:Name="txtPXENetworkSharePath"
+                                        Width="320"
+                                        ToolTip="UNC path, for example: \\server\FFUDeploy" />
+                            </StackPanel>
+                        </StackPanel>
+
                         <!-- Row 9: Build USB Drive Section -->
-                        <StackPanel Grid.Row="9" Margin="0,10,0,5" x:Name="usbDriveSection" Visibility="Collapsed">
+                        <StackPanel Grid.Row="10" Margin="0,10,0,5" x:Name="usbDriveSection" Visibility="Collapsed">
                             <TextBlock Text="Build USB Drive Settings" FontWeight="Bold" FontSize="16" Margin="0,0,0,10"/>
                             <StackPanel Margin="5,0,0,10">
                                 <CheckBox x:Name="chkAllowExternalHardDiskMedia" Content="Allow External Hard Disk Media" Margin="5" VerticalAlignment="Center" Tag="When set to $true, will allow the use of external hard disk media."/>
@@ -792,7 +810,7 @@
                         </StackPanel>
 
                         <!-- Row 10: Post-Build Cleanup -->
-                        <StackPanel Grid.Row="10" Margin="0,10,0,5">
+                        <StackPanel Grid.Row="11" Margin="0,10,0,5">
                             <TextBlock Text="Post-Build Cleanup" FontWeight="Bold" FontSize="16" Margin="0,0,0,5"/>
                             <CheckBox x:Name="chkCleanupAppsISO" Content="Cleanup Apps ISO" Margin="5" VerticalAlignment="Center" Tag="Remove Apps ISO after FFU capture."/>
                             <CheckBox x:Name="chkCleanupCaptureISO" Content="Cleanup Capture ISO" Margin="5" VerticalAlignment="Center" Tag="Remove WinPE capture ISO after FFU capture."/>
