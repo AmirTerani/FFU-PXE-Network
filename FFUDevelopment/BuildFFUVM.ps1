@@ -326,6 +326,8 @@ param(
     [bool]$CreatePXEBootMedia,
     [bool]$UseNetworkShareForDeploy,
     [string]$PXENetworkSharePath,
+    [string]$PXENetworkUsername,
+    [string]$PXENetworkPassword,
     [ValidateScript({
             $allowedFeatures = @("Windows-Defender-Default-Definitions", "Printing-PrintToPDFServices-Features", "Printing-XPSServices-Features", "TelnetClient", "TFTP",
                 "TIFFIFilter", "LegacyComponents", "DirectPlay", "MSRDC-Infrastructure", "Windows-Identity-Foundation", "MicrosoftWindowsPowerShellV2Root", "MicrosoftWindowsPowerShellV2",
@@ -764,25 +766,34 @@ function Get-PxeShareMapping {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [string]$SharePath
+        [string]$SharePath,
+
+        [string]$Username,
+
+        [Security.SecureString]$Password
     )
 
     if ([string]::IsNullOrWhiteSpace($SharePath)) {
         throw "PXENetworkSharePath is empty. Configure it in the UI or config file."
     }
 
-    # Normalize UNC: ensure it starts with double backslash
-    if (-not $SharePath.StartsWith('\\')) {
+    if (-not $SharePath.StartsWith('\')) {
         throw "PXENetworkSharePath must be a UNC path such as \\server\share. Current value is: $SharePath"
     }
 
-    WriteLog "Prompting for network credentials for $SharePath"
-    $cred = Get-Credential -Message "Enter credentials that have read and write access to $SharePath"
+    $cred = $null
 
-    # Choose a transient drive letter that is unlikely to be in use
+    if (-not [string]::IsNullOrWhiteSpace($Username) -and $Password) {
+        WriteLog "Using supplied PXE network credentials for $SharePath"
+        $cred = New-Object System.Management.Automation.PSCredential($Username, $Password)
+    }
+    else {
+        WriteLog "PXE credentials not provided in config. Falling back to Get-Credential prompt."
+        $cred = Get-Credential -Message "Enter credentials that have read and write access to $SharePath"
+    }
+
     $driveLetter = 'Z'
 
-    # Remove any existing PSDrive with this name
     $existing = Get-PSDrive -Name $driveLetter -ErrorAction SilentlyContinue
     if ($existing) {
         Remove-PSDrive -Name $driveLetter -Force
@@ -797,7 +808,6 @@ function Get-PxeShareMapping {
         Credential  = $cred
     }
 }
-
 
 function Get-MicrosoftDrivers {
     param (
@@ -2900,24 +2910,32 @@ function New-PEMedia {
         Copy-Item -Path "$FFUDevelopmentPath\WinPEDeployFFUFiles\*" -Destination "$WinPEFFUPath\mount" -Recurse -Force | Out-Null
         WriteLog 'Copy complete'
 
-        
-    # If we have PXE context, stamp the deployment script with the correct paths
-    if ($UseNetworkShareForDeploy -and $script:PXEDeployContext) {
-        $deployScriptPath = Join-Path "$WinPEFFUPath\mount" "DeployFFUFromShare.ps1"
+        # If we have PXE context, stamp the deployment script with the correct paths and credentials
+        if ($UseNetworkShareForDeploy -and $script:PXEDeployContext) {
+            $deployScriptPath = Join-Path "$WinPEFFUPath\mount" "DeployFFUFromShare.ps1"
 
-        if (Test-Path $deployScriptPath) {
-            WriteLog "Stamping DeployFFUFromShare.ps1 with PXE paths"
+            if (Test-Path $deployScriptPath) {
+                WriteLog "Stamping DeployFFUFromShare.ps1 with PXE paths and credentials"
 
-            $content = Get-Content $deployScriptPath -Raw
-            $content = $content.Replace("##PXE_SHARE_PATH##", $script:PXEDeployContext.SharePath)
-            $content = $content.Replace("##PXE_REL_FFU##",    $script:PXEDeployContext.RelativeFFU)
+                $content = Get-Content $deployScriptPath -Raw
 
-            Set-Content -Path $deployScriptPath -Value $content -Encoding UTF8
+                # Paths
+                $content = $content.Replace("##PXE_SHARE_PATH##", $script:PXEDeployContext.SharePath)
+                $content = $content.Replace("##PXE_REL_FFU##",    $script:PXEDeployContext.RelativeFFU)
+
+                # Credentials from UI config (password already base64 encoded in config)
+                $content = $content.Replace("##PXE_USER##",       $PXENetworkUsername)
+                $content = $content.Replace("##PXE_PWD_BASE64##", $PXENetworkPassword)
+
+                Set-Content -Path $deployScriptPath -Value $content -Encoding UTF8
+            }
+            else {
+                WriteLog "DeployFFUFromShare.ps1 not found in WinPEDeployFFUFiles, PXE stamping skipped."
+            }
         }
-        else {
-            WriteLog "DeployFFUFromShare.ps1 not found in WinPEDeployFFUFiles, PXE stamping skipped."
-        }
-    }
+
+
+
 
         #If $CopyPEDrivers = $true, add drivers to WinPE media using dism
         if ($CopyPEDrivers) {
@@ -3257,13 +3275,32 @@ function New-FFU {
     }
 
     # After $FFUFile has been resolved and the capture is complete
-
     if ($UseNetworkShareForDeploy -and -not [string]::IsNullOrWhiteSpace($PXENetworkSharePath)) {
 
         WriteLog "UseNetworkShareForDeploy is enabled. Preparing to copy FFU to $PXENetworkSharePath"
 
-        $pxeMapping = Get-PxeShareMapping -SharePath $PXENetworkSharePath
+        $securePassword = $null
+
+        if (-not [string]::IsNullOrWhiteSpace($PXENetworkPassword)) {
+            try {
+                $pwdBytes = [Convert]::FromBase64String($PXENetworkPassword)
+                $plainPwd = [System.Text.Encoding]::UTF8.GetString($pwdBytes)
+                $securePassword = ConvertTo-SecureString $plainPwd -AsPlainText -Force
+            }
+            catch {
+                WriteLog "Failed to decode PXE network password from base64, falling back to credential prompt. Error: $($_.Exception.Message)"
+            }
+        }
+
+        $pxeMapping = Get-PxeShareMapping `
+            -SharePath $PXENetworkSharePath `
+            -Username  $PXENetworkUsername `
+            -Password  $securePassword
+
         $deployRoot = "$($pxeMapping.DriveLetter):"
+
+        # rest of the FFU copy logic...
+    
 
         # Create a folder structure for the FFU
         $ffuFolder = Join-Path $deployRoot "FFU"
@@ -3294,31 +3331,6 @@ function New-FFU {
         Start-Sleep 120
     }
 
-    #Add drivers
-    If ($InstallDrivers) {
-        Set-Progress -Percentage 75 -Message "Injecting drivers into FFU..."
-        WriteLog 'Adding drivers'
-        WriteLog "Creating $FFUDevelopmentPath\Mount directory"
-        New-Item -Path "$FFUDevelopmentPath\Mount" -ItemType Directory -Force | Out-Null
-        WriteLog "Created $FFUDevelopmentPath\Mount directory"
-        WriteLog "Mounting $FFUFile to $FFUDevelopmentPath\Mount"
-        Mount-WindowsImage -ImagePath $FFUFile -Index 1 -Path "$FFUDevelopmentPath\Mount" | Out-null
-        WriteLog 'Mounting complete'
-        WriteLog 'Adding drivers - This will take a few minutes, please be patient'
-        try {
-            Add-WindowsDriver -Path "$FFUDevelopmentPath\Mount" -Driver "$DriversFolder" -Recurse -ErrorAction SilentlyContinue -WarningAction SilentlyContinue | Out-null
-        }
-        catch {
-            WriteLog 'Some drivers failed to be added to the FFU. This can be expected. Continuing.'
-        }
-        WriteLog 'Adding drivers complete'
-        WriteLog "Dismount $FFUDevelopmentPath\Mount"
-        Dismount-WindowsImage -Path "$FFUDevelopmentPath\Mount" -Save | Out-Null
-        WriteLog 'Dismount complete'
-        WriteLog "Remove $FFUDevelopmentPath\Mount folder"
-        Remove-Item -Path "$FFUDevelopmentPath\Mount" -Recurse -Force | Out-null
-        WriteLog 'Folder removed'
-    }
     #Optimize FFU
     if ($Optimize -eq $true) {
         Set-Progress -Percentage 85 -Message "Optimizing FFU..."
